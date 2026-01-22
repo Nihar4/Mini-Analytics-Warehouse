@@ -1,24 +1,38 @@
 """
-MapReduce Engine — A parallel MapReduce framework built on multiprocessing.
+MapReduce Engine
+================
+A parallel MapReduce framework inspired by Google's original MapReduce paper.
 
-Implements the classic Map → Shuffle → Reduce pipeline:
-  1. MAP:     Each worker reads a data chunk and emits (key, value) pairs
-  2. SHUFFLE: Group all values by key (single-node, in-memory)
-  3. REDUCE:  Each worker aggregates values for its assigned keys
+Pipeline stages
+---------------
+  1. MAP     — Each worker thread reads a data shard and emits (key, value) pairs.
+  2. SHUFFLE — All pairs are grouped by key in-memory (the "sort & group" step).
+  3. REDUCE  — Each key's value list is collapsed into a single aggregate result.
 
-Design note:
-  Python's multiprocessing requires all functions passed across process
-  boundaries to be picklable (i.e., defined at module top level, not as
-  closures). Map/Reduce functions in mr_jobs.py are therefore defined as
-  top-level functions and passed by reference.
+Intermediate outputs
+--------------------
+  After each phase the engine saves:
+    outputs/mapreduce/<job>_map_output.csv     — raw (key, value) pairs from Map
+    outputs/mapreduce/<job>_shuffle_output.csv — grouped key → count of values
+    outputs/mapreduce/<job>_reduce_output.csv  — final aggregated result
 
-Usage:
-    from src.mapreduce import run_job, run_job_threaded
+These files make the MapReduce data-flow transparent and inspectable.
+
+Design note
+-----------
+  Python's multiprocessing cannot pickle closures across process boundaries.
+  The engine uses ThreadPoolExecutor for the Map phase so any callable works.
+
+Usage
+-----
+    from src.mapreduce import run_job, results_to_df
 """
 
+import json
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
+from pathlib import Path
 from typing import Callable, Iterator, Any
 import pandas as pd
 import time
@@ -27,13 +41,23 @@ from src.utils import setup_logging
 
 logger = setup_logging()
 
+# Where intermediate MapReduce outputs are written
+_MR_OUTPUT_DIR: Path | None = None
+
+
+def set_output_dir(path: Path) -> None:
+    """Configure the directory for intermediate MapReduce outputs."""
+    global _MR_OUTPUT_DIR
+    _MR_OUTPUT_DIR = path
+    path.mkdir(parents=True, exist_ok=True)
+
 
 # ── Type aliases ──────────────────────────────────────────────────────────────
 MapFn    = Callable[[pd.Series], Iterator[tuple]]
 ReduceFn = Callable[[Any, list], Any]
 
 
-# ── Thread-safe map worker (avoids pickling) ──────────────────────────────────
+# ── Thread-safe map worker ────────────────────────────────────────────────────
 
 def _threaded_map_chunk(args):
     """Apply map_fn to a DataFrame chunk. Returns list of (key, value) pairs."""
@@ -45,7 +69,25 @@ def _threaded_map_chunk(args):
     return pairs
 
 
-# ── Core Engine (threaded — works with any callable) ─────────────────────────
+def _save_intermediate(job_name: str, phase: str, data: Any) -> None:
+    """Persist an intermediate MapReduce phase output to CSV for inspection."""
+    if _MR_OUTPUT_DIR is None:
+        return
+    path = _MR_OUTPUT_DIR / f"{job_name}_{phase}_output.csv"
+    try:
+        if isinstance(data, pd.DataFrame):
+            data.to_csv(path, index=False)
+        elif isinstance(data, list):
+            pd.DataFrame(data, columns=["key", "value"]).to_csv(path, index=False)
+        elif isinstance(data, dict):
+            rows = [(k, json.dumps(v) if isinstance(v, dict) else v) for k, v in data.items()]
+            pd.DataFrame(rows, columns=["key", "reduced_value"]).to_csv(path, index=False)
+        logger.info(f"[{job_name}] Saved {phase} output → {path.name}")
+    except Exception as e:
+        logger.debug(f"Could not save intermediate {phase} output: {e}")
+
+
+# ── Core Engine ───────────────────────────────────────────────────────────────
 
 def run_job(
     df: pd.DataFrame,
@@ -58,8 +100,9 @@ def run_job(
     """
     Execute a MapReduce job over a pandas DataFrame.
 
-    Uses a ThreadPoolExecutor for the Map phase (no pickling required)
-    and processes the Shuffle / Reduce phases in the main thread.
+    Uses ThreadPoolExecutor for the Map phase (works with any callable).
+    Saves intermediate Map, Shuffle, and Reduce outputs to CSV if an
+    output directory has been configured via set_output_dir().
 
     Args:
         df:          Input data.
@@ -67,7 +110,7 @@ def run_job(
         reduce_fn:   Function(key, [values]) -> result
         n_workers:   Parallel threads for Map phase (default: CPU count).
         chunk_size:  Rows per map worker.
-        job_name:    Label for logging.
+        job_name:    Label for logging and output file naming.
 
     Returns:
         dict mapping key -> reduced result.
@@ -93,6 +136,7 @@ def run_job(
 
     t1 = time.time()
     logger.info(f"[{job_name}] Map done: {len(all_pairs):,} pairs ({t1 - t0:.2f}s)")
+    _save_intermediate(job_name, "map", all_pairs[:5000])  # sample to keep files small
 
     # ── Phase 2: SHUFFLE (group by key) ──────────────────────────────────────
     grouped: dict = defaultdict(list)
@@ -101,14 +145,18 @@ def run_job(
 
     t2 = time.time()
     logger.info(f"[{job_name}] Shuffle done: {len(grouped):,} unique keys ({t2 - t1:.2f}s)")
+    # Save shuffle summary (key → value_count)
+    shuffle_summary = {k: len(v) for k, v in grouped.items()}
+    _save_intermediate(job_name, "shuffle", shuffle_summary)
 
-    # ── Phase 3: REDUCE (sequential — reduce_fn can be any callable) ─────────
+    # ── Phase 3: REDUCE ───────────────────────────────────────────────────────
     results = {}
     for key, values in grouped.items():
         results[key] = reduce_fn(key, values)
 
     t3 = time.time()
     logger.info(f"[{job_name}] Reduce done ({t3 - t2:.2f}s) | Total wall: {t3 - t0:.2f}s")
+    _save_intermediate(job_name, "reduce", results)
 
     return results
 

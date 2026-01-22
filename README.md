@@ -1,74 +1,141 @@
-# Mini Analytics Warehouse
+<div align="center">
 
-A mini analytics warehouse built in Python that transforms raw clickstream CSV data into partitioned Parquet datasets, enables fast SQL-based analytics with DuckDB, and implements a custom parallel **MapReduce engine** — all running locally.
+# Mini BigQuery — Local Analytics Warehouse
+
+**A production-style analytics warehouse built in Python.**
+Ingest raw event data → ETL pipeline → partitioned Parquet storage → SQL analytics with DuckDB → parallel MapReduce engine.
+
+Inspired by Google BigQuery, Apache Hadoop MapReduce, and modern data lakehouse architectures.
+
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)](https://python.org)
+[![DuckDB](https://img.shields.io/badge/DuckDB-OLAP%20Engine-yellow)](https://duckdb.org)
+[![Parquet](https://img.shields.io/badge/Storage-Parquet-orange)](https://parquet.apache.org)
+[![MapReduce](https://img.shields.io/badge/Processing-MapReduce-green)](#mapreduce-engine)
+
+</div>
 
 ---
 
-## Why This Project Matters
+## What Is This?
 
-Modern analytics teams work with data warehouses like BigQuery, Snowflake, and Redshift — backed by distributed processing frameworks like MapReduce, Apache Spark, and Dataflow. This project recreates that workflow locally:
+A local data engineering project that replicates the core architecture of a cloud analytics warehouse — without any cloud infrastructure.
 
-- **Raw ingestion** → ETL pipeline → **clean analytical schema**
-- **Partitioned Parquet** storage (like BigQuery's date-partitioned tables)
-- **SQL query layer** via DuckDB (an embedded OLAP database)
-- **Materialized aggregate tables** for precomputed metrics
-- **Custom MapReduce engine** implementing the Map → Shuffle → Reduce pattern
+| Cloud Concept | This Project |
+|---|---|
+| BigQuery table partitioning | Parquet files partitioned by `event_date` |
+| BigQuery SQL analytics | DuckDB embedded OLAP SQL engine |
+| Dataflow / Dataproc ETL | Python ETL pipeline with schema mapping |
+| Hadoop MapReduce jobs | Custom parallel MapReduce engine in Python |
+| Data warehouse tables | DuckDB materialized aggregate tables |
+| Query result exports | CSV outputs per query |
 
-It demonstrates real-world analytics engineering skills without cloud infrastructure costs.
+The project processes **165,000+ real e-commerce clickstream events** (April–August 2008) through every layer of the stack.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────────┐     ┌──────────────────┐
-│  Raw CSV    │────▶│  ETL Pipeline   │────▶│  Parquet Files   │
-│ (data/raw/) │     │  scripts/etl.py │     │  partitioned by  │
-└─────────────┘     └─────────────────┘     │   event_date     │
-                           │                └────────┬─────────┘
-                    • Column mapping                  │
-                    • Type casting          ┌─────────┴──────────────────────┐
-                    • Derived columns       │                                │
-                    • Data validation       ▼                                ▼
-                                   ┌──────────────┐              ┌────────────────────┐
-                                   │  DuckDB SQL  │              │  MapReduce Engine  │
-                                   │  Warehouse   │              │  (ThreadPool)      │
-                                   │              │              │                    │
-                                   │ • Aggregate  │              │ • Map phase        │
-                                   │   tables     │              │ • Shuffle phase    │
-                                   │ • SQL queries│              │ • Reduce phase     │
-                                   │ • CSV output │              │ • Chained jobs     │
-                                   └──────────────┘              └────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          RAW DATA LAYER                                  │
+│   data/raw/events.csv  (CSV, semi-colon delimited, 165K+ rows)           │
+└────────────────────────────┬─────────────────────────────────────────────┘
+                             │  python scripts/etl.py
+                             ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          ETL PIPELINE  (src/transformations.py)          │
+│                                                                          │
+│  ┌──────────────┐   ┌──────────────┐   ┌────────────────────────────┐   │
+│  │ Column       │   │ Type casting │   │ Derived columns            │   │
+│  │ mapping      │──▶│ + validation │──▶│ event_date, event_hour,    │   │
+│  │ (auto-detect)│   │              │   │ event_month, category_name │   │
+│  └──────────────┘   └──────────────┘   └────────────────────────────┘   │
+└────────────────────────────┬─────────────────────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     PARTITIONED STORAGE LAYER                            │
+│                                                                          │
+│   data/processed/events_parquet/                                         │
+│   ├── event_date_str=2008-04-01/  ← partition 1                         │
+│   ├── event_date_str=2008-04-02/  ← partition 2                         │
+│   └── ... (135 date partitions)                                          │
+│                                                                          │
+│   Format: Apache Parquet (columnar, compressed)                          │
+│   Partitioning: by event_date (mirrors BigQuery date partitioning)       │
+└──────────────┬───────────────────────────────┬───────────────────────────┘
+               │                               │
+               ▼                               ▼
+┌──────────────────────────┐     ┌─────────────────────────────────────────┐
+│   DUCKDB SQL LAYER        │     │   MAPREDUCE ENGINE                      │
+│   (src/warehouse.py)      │     │   (src/mapreduce.py + src/mr_jobs.py)   │
+│                           │     │                                         │
+│  analytics.duckdb         │     │   Phase 1 — MAP (ThreadPoolExecutor)    │
+│  ├── daily_metrics        │     │     row → emit (key, value) pairs        │
+│  ├── top_products         │     │                                         │
+│  ├── country_metrics      │     │   Phase 2 — SHUFFLE (group by key)      │
+│  └── category_metrics     │     │     {"key": [v1, v2, v3, ...]}          │
+│                           │     │                                         │
+│  9 reusable SQL files     │     │   Phase 3 — REDUCE (aggregate)          │
+│  in sql/                  │     │     key → final result                  │
+│                           │     │                                         │
+│  python scripts/          │     │   Saves intermediates:                  │
+│    run_queries.py         │     │   outputs/mapreduce/*_map_output.csv    │
+│    build_warehouse.py     │     │   outputs/mapreduce/*_shuffle_output.csv│
+└──────────────────────────┘     │   outputs/mapreduce/*_reduce_output.csv │
+                                  └─────────────────────────────────────────┘
 ```
 
 ---
 
-## Dataset Expectations
+## MapReduce Engine
 
-Place a CSV file in `data/raw/`. The pipeline auto-detects separators (`,`, `;`, `\t`, `|`) and maps common column names automatically.
+The core engineering highlight of this project.
 
-### Supported Column Patterns
+### How Map → Shuffle → Reduce works
 
-| Column Type       | Accepted Names                                              |
-|-------------------|-------------------------------------------------------------|
-| **Timestamp**     | `timestamp`, `event_time`, `date`, or `year`+`month`+`day` |
-| **User/Session**  | `session_id`, `user_id`, `visitor_id`                       |
-| **Event Type**    | `event_type`, `action`                                      |
-| **Product**       | `product_id`, `page 2 (clothing model)`                     |
-| **Category**      | `category`, `page 1 (main category)`                        |
-| **Price**         | `price`, `revenue`, `amount`                                |
-| **Geography**     | `country`, `region`                                         |
-| **Device**        | `device`, `device_type`                                     |
+```
+INPUT: 165,474 event rows
+       ─────────────────
 
-### Sample CSV Format
+PHASE 1 — MAP  (8 parallel threads)
+  Each thread processes a 10,000-row shard and emits key-value pairs.
 
-```csv
-year;month;day;order;country;session ID;page 1 (main category);page 2 (clothing model);colour;location;model photography;price;price 2;page
-2008;4;1;1;29;1;1;A13;1;5;1;28;2;1
-2008;4;1;2;29;1;1;A16;1;6;1;33;2;1
+  Thread 1:  row → ("Trousers", 46.71)
+  Thread 2:  row → ("Skirts",   52.00)
+  Thread 3:  row → ("Trousers", 33.00)
+  Thread 4:  row → ("Sale",     28.00)
+  ...
+  Output: 165,474 (key, value) pairs saved to *_map_output.csv
+
+PHASE 2 — SHUFFLE  (group by key)
+  All pairs from all threads are grouped by key.
+
+  "Trousers" → [46.71, 33.00, 62.00, ...]   (49,742 values)
+  "Skirts"   → [52.00, 67.00, ...]           (38,408 values)
+  "Blouses"  → [40.00, 18.00, ...]           (38,577 values)
+  "Sale"     → [28.00, 23.00, ...]           (38,747 values)
+  Output: shuffle summary saved to *_shuffle_output.csv
+
+PHASE 3 — REDUCE  (aggregate each key's values)
+  "Trousers" → sum=2,323,692  count=49,742  avg=46.71
+  "Skirts"   → sum=1,966,199  count=38,408  avg=51.19
+  "Blouses"  → sum=1,554,334  count=38,577  avg=40.29
+  "Sale"     → sum=1,403,951  count=38,747  avg=36.23
+  Output: final results saved to *_reduce_output.csv + loaded into DuckDB
 ```
 
-If a column is missing, the pipeline gracefully skips related analytics — no crashes.
+### Implemented MapReduce Jobs
+
+| Job | Map emits | Reduce computes | Stage |
+|-----|-----------|-----------------|-------|
+| `event_count_by_type` | `(event_type, 1)` | `sum` | Single |
+| `country_event_count` | `(country, {events, session})` | `sum + distinct` | Single |
+| `revenue_by_category` | `(category, price)` | `sum/count/avg/min/max` | Single |
+| `total_events_by_day` | `(event_date, 1)` | `sum` | Single |
+| `daily_active_users` | `(event_date, session_id)` | `len(set)` | Single |
+| `top_products` | `(product_id, {count, revenue, session})` | `aggregate` | Single |
+| `session_depth` | Stage 1: `(session_id, 1)` → Stage 2: `(depth, 1)` | `sum` × 2 | **Chained** |
 
 ---
 
@@ -77,20 +144,25 @@ If a column is missing, the pipeline gracefully skips related analytics — no c
 ```
 mini-analytics-warehouse/
 ├── data/
-│   ├── raw/                        # Drop your CSV here
+│   ├── raw/                            # Input CSV files
 │   ├── processed/
-│   │   └── events_parquet/         # Partitioned Parquet output
+│   │   └── events_parquet/             # Parquet, partitioned by event_date
 │   └── warehouse/
-│       └── analytics.duckdb        # Materialized DuckDB database
+│       └── analytics.duckdb            # DuckDB warehouse database
 ├── outputs/
-│   ├── query_results/              # CSV exports (SQL + MapReduce results)
-│   └── charts/                     # PNG charts
+│   ├── query_results/                  # SQL + MapReduce result CSVs
+│   ├── charts/                         # PNG visualizations
+│   └── mapreduce/                      # Intermediate MapReduce phase outputs
+│       ├── <job>_map_output.csv        # Raw emitted (key, value) pairs
+│       ├── <job>_shuffle_output.csv    # Grouped key → value counts
+│       ├── <job>_reduce_output.csv     # Final aggregated result
+│       └── mr_results.duckdb           # MapReduce results in DuckDB
 ├── scripts/
-│   ├── etl.py                      # ETL pipeline CLI
-│   ├── build_warehouse.py          # Build DuckDB aggregate tables
-│   ├── run_queries.py              # Run SQL analytics queries
-│   ├── run_mapreduce.py            # Run MapReduce analytics jobs
-│   └── analysis.py                 # Interactive analysis with plots
+│   ├── etl.py                          # ETL pipeline
+│   ├── build_warehouse.py              # Build DuckDB aggregate tables
+│   ├── run_queries.py                  # SQL analytics query runner
+│   ├── run_mapreduce.py                # MapReduce job runner
+│   └── analysis.py                     # Interactive analysis + charts
 ├── sql/
 │   ├── total_events_by_day.sql
 │   ├── daily_active_users.sql
@@ -102,15 +174,13 @@ mini-analytics-warehouse/
 │   ├── monthly_trends.sql
 │   └── session_depth.sql
 ├── src/
-│   ├── __init__.py
-│   ├── config.py                   # Paths, column mappings, settings
-│   ├── utils.py                    # Logging, file helpers
-│   ├── schema.py                   # Column mapping & validation
-│   ├── transformations.py          # Data cleaning & Parquet writing
-│   ├── warehouse.py                # DuckDB query & aggregate layer
-│   ├── mapreduce.py                # MapReduce engine (Map/Shuffle/Reduce)
-│   └── mr_jobs.py                  # Analytics jobs for MapReduce engine
-├── README.md
+│   ├── config.py                       # Paths, column mappings, settings
+│   ├── utils.py                        # Logging, directory helpers
+│   ├── schema.py                       # Column auto-mapping and validation
+│   ├── transformations.py              # Data cleaning, Parquet writer
+│   ├── warehouse.py                    # DuckDB aggregate table builder
+│   ├── mapreduce.py                    # MapReduce engine (Map/Shuffle/Reduce)
+│   └── mr_jobs.py                      # All MapReduce job definitions
 ├── requirements.txt
 └── .gitignore
 ```
@@ -119,127 +189,89 @@ mini-analytics-warehouse/
 
 ## Setup
 
-### Prerequisites
-
-- Python 3.9+
-- pip
-
-### Install
-
 ```bash
 git clone https://github.com/Nihar4/Mini-Analytics-Warehouse.git
 cd mini-analytics-warehouse
 
 python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-
+source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### Add Your Data
-
-```bash
-cp your-dataset.csv data/raw/events.csv
 ```
 
 ---
 
-## Usage
+## Running the Full Pipeline
 
-### Step 1 — Run the ETL Pipeline
+### Step 1 — ETL: Ingest and Transform
 
 ```bash
 python scripts/etl.py --input data/raw/events.csv
 ```
 
-- Loads and validates the CSV
-- Auto-maps columns to a standard analytical schema
-- Creates derived columns: `event_date`, `event_hour`, `event_month`, `day_of_week`, `category_name`
-- Writes **partitioned Parquet files** to `data/processed/events_parquet/`
+- Auto-detects CSV separator and maps column names to standard schema
+- Builds derived columns: `event_date`, `event_hour`, `event_month`, `day_of_week`, `category_name`
+- Writes **135 date-partitioned Parquet files** to `data/processed/events_parquet/`
 
-### Step 2 — Build the Warehouse
+### Step 2 — Build the SQL Warehouse
 
 ```bash
 python scripts/build_warehouse.py
 ```
 
-Creates `data/warehouse/analytics.duckdb` with materialized aggregate tables:
+Creates `data/warehouse/analytics.duckdb` with precomputed aggregate tables:
+`daily_metrics`, `top_products`, `country_metrics`, `category_metrics`
 
-| Table              | Content                                |
-|--------------------|----------------------------------------|
-| `daily_metrics`    | Events, sessions, revenue per day      |
-| `top_products`     | Most viewed products with revenue      |
-| `country_metrics`  | Activity breakdown by country          |
-| `category_metrics` | Events and revenue by product category |
-
-### Step 3 — Run SQL Analytics Queries
+### Step 3 — Run SQL Queries
 
 ```bash
-# All queries
-python scripts/run_queries.py
-
-# Specific query
+python scripts/run_queries.py                          # all 9 queries
 python scripts/run_queries.py --query daily_active_users
-
-# More rows
 python scripts/run_queries.py --query top_products --show 25
 ```
-
-Results saved as CSVs in `outputs/query_results/`.
 
 ### Step 4 — Run MapReduce Jobs
 
 ```bash
-# All MapReduce jobs
-python scripts/run_mapreduce.py
-
-# Specific job
-python scripts/run_mapreduce.py --job top_products
-
-# Compare MapReduce vs DuckDB SQL timings
-python scripts/run_mapreduce.py --compare
+python scripts/run_mapreduce.py                        # all 7 jobs
+python scripts/run_mapreduce.py --job revenue_by_category
+python scripts/run_mapreduce.py --job event_count_by_type
+python scripts/run_mapreduce.py --job country_event_count
+python scripts/run_mapreduce.py --compare              # benchmark vs DuckDB
 ```
 
-Available MapReduce jobs:
+Each job saves three intermediate CSV files showing the Map, Shuffle, and Reduce phases explicitly.
 
-| Job                   | Description                                           |
-|-----------------------|-------------------------------------------------------|
-| `total_events_by_day` | Count events per day                                  |
-| `daily_active_users`  | Unique sessions per day                               |
-| `revenue_by_category` | Revenue, count, and avg price per category            |
-| `top_products`        | Top products by views, sessions, revenue              |
-| `country_breakdown`   | Events and sessions by country                        |
-| `session_depth`       | Two-stage chained job: pages-per-session distribution |
-
-### Step 5 — Interactive Analysis with Charts
+### Step 5 — Analysis and Charts
 
 ```bash
 python scripts/analysis.py
 ```
 
-Prints dataset summaries and saves 4 charts to `outputs/charts/`.
-
 ---
 
-## Sample Output
+## Sample Outputs
 
-### Daily Active Users (SQL)
-
-```
-event_date  active_users
-2008-04-01           477
-2008-04-02           480
-2008-04-03           276
-```
-
-### Revenue by Category (MapReduce)
+### MapReduce: Revenue by Category
 
 ```
+Map phase:    165,474 (category, price) pairs emitted
+Shuffle phase: 4 unique category keys
+Reduce phase:  sum / count / avg / min / max per category
+
 category_name  total_revenue  event_count  avg_price
-     Trousers      2323692.0        49742      46.71
-       Skirts      1966199.0        38408      51.19
-      Blouses      1554334.0        38577      40.29
-         Sale      1403951.0        38747      36.23
+     Trousers    2,323,692.0       49,742      46.71
+       Skirts    1,966,199.0       38,408      51.19
+      Blouses    1,554,334.0       38,577      40.29
+         Sale    1,403,951.0       38,747      36.23
+```
+
+### MapReduce: Country Event Count
+
+```
+country  total_events  unique_sessions
+     29        133,963           19,582
+      9         18,003            2,261
+     24          4,091              527
 ```
 
 ### MapReduce vs DuckDB Timing
@@ -247,85 +279,60 @@ category_name  total_revenue  event_count  avg_price
 ```
 Job                          MapReduce   DuckDB SQL  Winner
 ------------------------------------------------------------
-total_events_by_day           1.673s      0.059s    DuckDB
-daily_active_users            1.793s      0.056s    DuckDB
-revenue_by_category           1.711s      0.053s    DuckDB
-country_breakdown             1.824s      0.056s    DuckDB
+event_count_by_type           1.96s       0.06s    DuckDB
+country_event_count           1.72s       0.05s    DuckDB
+revenue_by_category           1.93s       0.05s    DuckDB
+total_events_by_day           1.67s       0.06s    DuckDB
 ```
 
-> DuckDB wins single-machine benchmarks due to vectorized columnar execution.
-> MapReduce shines at scale across distributed nodes — the same pattern powers
-> Hadoop, Google's original MapReduce paper, and Apache Spark.
+> DuckDB wins locally — vectorized columnar execution is extremely fast on a single machine.
+> MapReduce wins at distributed scale: Google processed petabytes using this same
+> Map → Shuffle → Reduce pattern. The architecture is identical to Hadoop MapReduce
+> and is the conceptual foundation of Apache Spark's RDD transformations.
 
 ---
 
-## Key Technical Concepts
+## Key Concepts
 
 ### Partitioned Parquet Storage
+Data is written as Parquet files partitioned by `event_date`, mirroring BigQuery's date-partitioned table structure. Queries over a date range only read the relevant partitions (partition pruning), not the full dataset.
 
-Data is written as Parquet files partitioned by `event_date`, mirroring BigQuery's date-partitioned tables. Benefits:
+### MapReduce Pattern
+The Map → Shuffle → Reduce pattern was described in Google's 2004 paper *"MapReduce: Simplified Data Processing on Large Clusters"*. This project implements the same three phases locally:
+- **Map**: emit `(key, value)` pairs from each row — parallelized across threads
+- **Shuffle**: group all values by key — the "sort and group" step
+- **Reduce**: apply an aggregation function to each key's value list
 
-- Efficient date-range queries via partition pruning
-- Columnar compression for fast aggregations
-- Open standard readable by Spark, DuckDB, Pandas, and any analytics tool
+Intermediate outputs of all three phases are saved as inspectable CSV files in `outputs/mapreduce/`.
 
-### Analytical Schema Design
+### DuckDB Embedded OLAP
+DuckDB is an in-process OLAP database that reads Parquet files directly using vectorized columnar execution. It is used here as both a query layer over the Parquet lake and as a persistent store for MapReduce results.
 
-Raw messy column names are mapped to a clean, consistent schema using a configurable alias dictionary in `src/config.py`. Derived columns (`event_hour`, `event_month`, `day_of_week`, `category_name`) enrich the data for analytics without modifying the raw source.
-
-### DuckDB SQL Analytics
-
-[DuckDB](https://duckdb.org/) is an embedded OLAP database that queries Parquet files directly — no server needed. It provides:
-
-- Full SQL with window functions and analytical aggregations
-- Direct Parquet reading via `read_parquet()` with Hive partitioning support
-- In-process, zero-configuration
-- Vectorized columnar execution — very fast on local datasets
-
-### MapReduce Engine
-
-The custom MapReduce engine in `src/mapreduce.py` implements the classic three-phase pipeline:
-
-```
-Phase 1 — MAP  (parallel ThreadPoolExecutor)
-  Each data chunk → emit (key, value) pairs
-  e.g.  row → ("2008-04-01", 1)
-           ↓  165,474 pairs
-
-Phase 2 — SHUFFLE  (in-memory grouping)
-  Group all values by key
-  {"2008-04-01": [1, 1, 1, ...], "2008-04-02": [...]}
-           ↓  135 unique keys
-
-Phase 3 — REDUCE  (aggregation per key)
-  sum([1, 1, 1, ...]) → 3181 total events
-```
-
-The `session_depth` job demonstrates **two-stage chained MapReduce**:
-
-- **Stage 1:** `(session_id, 1)` → reduce → pages per session per user
-- **Stage 2:** `(page_count, 1)` → reduce → distribution of session depths
-
-### Materialized Aggregate Tables
-
-Precomputed aggregate tables in DuckDB mirror how production warehouses use summary tables to serve dashboard queries without re-scanning millions of raw rows on every request.
+### Chained MapReduce
+The `session_depth` job demonstrates multi-stage MapReduce: the output of Stage 1 (pages per session) becomes the input to Stage 2 (histogram of session depths). This is the same technique used in multi-stage Hadoop jobs and Spark chained transformations.
 
 ---
 
-## Inspired by Analytics Warehouses
+## Inspired By
 
-This project is inspired by the architecture of cloud analytics warehouses like **Google BigQuery**, **Snowflake**, and **Amazon Redshift**, and batch processing systems like **Hadoop MapReduce** and **Apache Spark**. It replicates core engineering patterns — ETL pipelines, partitioned storage, SQL analytics, aggregate tables, and distributed processing — in a lightweight, local Python environment.
+| System | Pattern borrowed |
+|--------|-----------------|
+| Google BigQuery | Date-partitioned table storage, SQL analytics layer |
+| Google MapReduce (2004 paper) | Map → Shuffle → Reduce pipeline |
+| Apache Hadoop | Distributed job execution, intermediate output persistence |
+| Apache Spark | Chained transformations, in-memory shuffle |
+| Amazon Redshift / Snowflake | Materialized aggregate tables, column-oriented storage |
 
-It is **not** a replacement for production systems, but demonstrates the same engineering principles at a learnable and portable scale.
+This project is **not** a replacement for any of these systems. It is a local, single-machine implementation of the same architectural patterns — designed to demonstrate understanding of distributed data processing at a learnable scale.
 
 ---
 
 ## Resume Bullets
 
-- Built a mini analytics warehouse in Python that transformed raw clickstream CSV data into partitioned Parquet datasets and enabled SQL-based analytics with DuckDB.
-- Implemented a custom parallel MapReduce engine (Map → Shuffle → Reduce) with ThreadPoolExecutor, replicating the core pattern used by Hadoop/Spark for distributed analytics.
-- Designed ETL pipelines and analytical schemas for event data, generating aggregate warehouse tables for daily metrics, user activity, and category-level insights.
-- Benchmarked MapReduce vs DuckDB SQL across multiple analytics queries to demonstrate trade-offs between distributed batch processing and vectorized columnar execution.
+- Engineered a local analytics warehouse in Python implementing Map→Shuffle→Reduce pipelines over 165K+ event rows with intermediate output persistence and DuckDB result loading.
+- Built a partitioned Parquet data lake (135 date partitions) with an ETL pipeline featuring auto-detection of CSV schemas, column normalization, and derived analytical columns.
+- Designed 7 MapReduce jobs (event counts, country breakdown, revenue aggregation, session depth histogram) and benchmarked against DuckDB SQL to demonstrate architectural trade-offs.
+- Implemented chained two-stage MapReduce for session depth analysis, mirroring multi-stage Hadoop job patterns used in production distributed systems.
 
 ---
 
