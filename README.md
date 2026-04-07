@@ -20,14 +20,14 @@ Inspired by Google BigQuery, Apache Hadoop MapReduce, and modern data lakehouse 
 
 A local data engineering project that replicates the core architecture of a cloud analytics warehouse — without any cloud infrastructure.
 
-| Cloud Concept | This Project |
-|---|---|
-| BigQuery table partitioning | Parquet files partitioned by `event_date` |
-| BigQuery SQL analytics | DuckDB embedded OLAP SQL engine |
-| Dataflow / Dataproc ETL | Python ETL pipeline with schema mapping |
-| Hadoop MapReduce jobs | Custom parallel MapReduce engine in Python |
-| Data warehouse tables | DuckDB materialized aggregate tables |
-| Query result exports | CSV outputs per query |
+| Cloud Concept               | This Project                               |
+| --------------------------- | ------------------------------------------ |
+| BigQuery table partitioning | Parquet files partitioned by `event_date`  |
+| BigQuery SQL analytics      | DuckDB embedded OLAP SQL engine            |
+| Dataflow / Dataproc ETL     | Python ETL pipeline with schema mapping    |
+| Hadoop MapReduce jobs       | Custom parallel MapReduce engine in Python |
+| Data warehouse tables       | DuckDB materialized aggregate tables       |
+| Query result exports        | CSV outputs per query                      |
 
 The project processes **165,000+ real e-commerce clickstream events** (April–August 2008) through every layer of the stack.
 
@@ -127,15 +127,15 @@ PHASE 3 — REDUCE  (aggregate each key's values)
 
 ### Implemented MapReduce Jobs
 
-| Job | Map emits | Reduce computes | Stage |
-|-----|-----------|-----------------|-------|
-| `event_count_by_type` | `(event_type, 1)` | `sum` | Single |
-| `country_event_count` | `(country, {events, session})` | `sum + distinct` | Single |
-| `revenue_by_category` | `(category, price)` | `sum/count/avg/min/max` | Single |
-| `total_events_by_day` | `(event_date, 1)` | `sum` | Single |
-| `daily_active_users` | `(event_date, session_id)` | `len(set)` | Single |
-| `top_products` | `(product_id, {count, revenue, session})` | `aggregate` | Single |
-| `session_depth` | Stage 1: `(session_id, 1)` → Stage 2: `(depth, 1)` | `sum` × 2 | **Chained** |
+| Job                   | Map emits                                          | Reduce computes         | Stage       |
+| --------------------- | -------------------------------------------------- | ----------------------- | ----------- |
+| `event_count_by_type` | `(event_type, 1)`                                  | `sum`                   | Single      |
+| `country_event_count` | `(country, {events, session})`                     | `sum + distinct`        | Single      |
+| `revenue_by_category` | `(category, price)`                                | `sum/count/avg/min/max` | Single      |
+| `total_events_by_day` | `(event_date, 1)`                                  | `sum`                   | Single      |
+| `daily_active_users`  | `(event_date, session_id)`                         | `len(set)`              | Single      |
+| `top_products`        | `(product_id, {count, revenue, session})`          | `aggregate`             | Single      |
+| `session_depth`       | Stage 1: `(session_id, 1)` → Stage 2: `(depth, 1)` | `sum` × 2               | **Chained** |
 
 ---
 
@@ -295,10 +295,13 @@ total_events_by_day           1.67s       0.06s    DuckDB
 ## Key Concepts
 
 ### Partitioned Parquet Storage
+
 Data is written as Parquet files partitioned by `event_date`, mirroring BigQuery's date-partitioned table structure. Queries over a date range only read the relevant partitions (partition pruning), not the full dataset.
 
 ### MapReduce Pattern
-The Map → Shuffle → Reduce pattern was described in Google's 2004 paper *"MapReduce: Simplified Data Processing on Large Clusters"*. This project implements the same three phases locally:
+
+The Map → Shuffle → Reduce pattern was described in Google's 2004 paper _"MapReduce: Simplified Data Processing on Large Clusters"_. This project implements the same three phases locally:
+
 - **Map**: emit `(key, value)` pairs from each row — parallelized across threads
 - **Shuffle**: group all values by key — the "sort and group" step
 - **Reduce**: apply an aggregation function to each key's value list
@@ -306,33 +309,26 @@ The Map → Shuffle → Reduce pattern was described in Google's 2004 paper *"Ma
 Intermediate outputs of all three phases are saved as inspectable CSV files in `outputs/mapreduce/`.
 
 ### DuckDB Embedded OLAP
+
 DuckDB is an in-process OLAP database that reads Parquet files directly using vectorized columnar execution. It is used here as both a query layer over the Parquet lake and as a persistent store for MapReduce results.
 
 ### Chained MapReduce
+
 The `session_depth` job demonstrates multi-stage MapReduce: the output of Stage 1 (pages per session) becomes the input to Stage 2 (histogram of session depths). This is the same technique used in multi-stage Hadoop jobs and Spark chained transformations.
 
 ---
 
 ## Inspired By
 
-| System | Pattern borrowed |
-|--------|-----------------|
-| Google BigQuery | Date-partitioned table storage, SQL analytics layer |
-| Google MapReduce (2004 paper) | Map → Shuffle → Reduce pipeline |
-| Apache Hadoop | Distributed job execution, intermediate output persistence |
-| Apache Spark | Chained transformations, in-memory shuffle |
-| Amazon Redshift / Snowflake | Materialized aggregate tables, column-oriented storage |
+| System                        | Pattern borrowed                                           |
+| ----------------------------- | ---------------------------------------------------------- |
+| Google BigQuery               | Date-partitioned table storage, SQL analytics layer        |
+| Google MapReduce (2004 paper) | Map → Shuffle → Reduce pipeline                            |
+| Apache Hadoop                 | Distributed job execution, intermediate output persistence |
+| Apache Spark                  | Chained transformations, in-memory shuffle                 |
+| Amazon Redshift / Snowflake   | Materialized aggregate tables, column-oriented storage     |
 
 This project is **not** a replacement for any of these systems. It is a local, single-machine implementation of the same architectural patterns — designed to demonstrate understanding of distributed data processing at a learnable scale.
-
----
-
-## Resume Bullets
-
-- Engineered a local analytics warehouse in Python implementing Map→Shuffle→Reduce pipelines over 165K+ event rows with intermediate output persistence and DuckDB result loading.
-- Built a partitioned Parquet data lake (135 date partitions) with an ETL pipeline featuring auto-detection of CSV schemas, column normalization, and derived analytical columns.
-- Designed 7 MapReduce jobs (event counts, country breakdown, revenue aggregation, session depth histogram) and benchmarked against DuckDB SQL to demonstrate architectural trade-offs.
-- Implemented chained two-stage MapReduce for session depth analysis, mirroring multi-stage Hadoop job patterns used in production distributed systems.
 
 ---
 
